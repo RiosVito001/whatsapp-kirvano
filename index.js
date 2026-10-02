@@ -25,6 +25,7 @@ let waStatus = "starting";
 let waPhone = null;
 let reconnectTimer = null;
 let processing = false;
+const deliveredMessageIds = new Set();
 
 function auth(req, res, next) {
   const h = req.headers.authorization || "";
@@ -87,6 +88,27 @@ async function connectWhatsApp() {
   });
 
   socket.ev.on("creds.update", authState.saveCreds);
+
+  socket.ev.on("messages.update", async (updates) => {
+    for (const item of updates || []) {
+      const messageId = item?.key?.id;
+      const status = Number(item?.update?.status ?? 0);
+      if (!messageId || status < 3) continue;
+
+      deliveredMessageIds.add(messageId);
+
+      try {
+        await queueApi("/delivery-by-message-id", {
+          method: "POST",
+          body: JSON.stringify({ message_id: messageId })
+        });
+        console.log("Mensagem entregue:", messageId);
+      } catch (e) {
+        console.error("Falha ao confirmar entrega:", e.message);
+      }
+    }
+  });
+
   socket.ev.on("connection.update", async (update) => {
     const connection = update.connection;
     const lastDisconnect = update.lastDisconnect;
@@ -131,9 +153,30 @@ async function processQueue() {
     const jid = phone + "@s.whatsapp.net";
     const exists = await socket.onWhatsApp(jid);
     if (!exists?.[0]?.exists) throw new Error("Número não encontrado no WhatsApp");
-    await socket.sendMessage(jid, { text: item.message });
-    await queueApi("/ack", { method: "POST", body: JSON.stringify({ id: item.id, status: "sent" }) });
-    console.log("Mensagem enviada:", item.id, phone);
+
+    const resolvedJid = exists[0].jid || jid;
+    const sent = await socket.sendMessage(resolvedJid, { text: item.message });
+    const messageId = sent?.key?.id;
+    if (!messageId) throw new Error("WhatsApp não retornou ID da mensagem");
+
+    await queueApi("/ack", {
+      method: "POST",
+      body: JSON.stringify({
+        id: item.id,
+        status: "accepted",
+        message_id: messageId,
+        jid: resolvedJid
+      })
+    });
+
+    if (deliveredMessageIds.has(messageId)) {
+      await queueApi("/delivery-by-message-id", {
+        method: "POST",
+        body: JSON.stringify({ message_id: messageId })
+      });
+    }
+
+    console.log("Mensagem aceita pelo WhatsApp:", item.id, phone, messageId);
   } catch (e) {
     console.error("Erro no processamento:", e.message);
     if (item?.id) {
