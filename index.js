@@ -1,11 +1,7 @@
 import express from "express";
 import QRCode from "qrcode";
 import pino from "pino";
-import makeWASocket, {
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-  useMultiFileAuthState
-} from "@whiskeysockets/baileys";
+import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } from "@whiskeysockets/baileys";
 
 const PORT = Number(process.env.PORT || 3000);
 const AUTH_DIR = process.env.AUTH_DIR || "/data/auth";
@@ -30,16 +26,16 @@ let waPhone = null;
 let reconnectTimer = null;
 let processing = false;
 
-function dashboardAuth(req, res, next) {
-  const header = req.headers.authorization || "";
-  if (!header.startsWith("Basic ")) {
+function auth(req, res, next) {
+  const h = req.headers.authorization || "";
+  if (!h.startsWith("Basic ")) {
     res.set("WWW-Authenticate", 'Basic realm="Rios Dashboard"');
     return res.status(401).send("Autenticação necessária");
   }
-  const decoded = Buffer.from(header.slice(6), "base64").toString("utf8");
-  const idx = decoded.indexOf(":");
-  const user = idx >= 0 ? decoded.slice(0, idx) : "";
-  const pass = idx >= 0 ? decoded.slice(idx + 1) : "";
+  const raw = Buffer.from(h.slice(6), "base64").toString("utf8");
+  const p = raw.indexOf(":");
+  const user = p >= 0 ? raw.slice(0, p) : "";
+  const pass = p >= 0 ? raw.slice(p + 1) : "";
   if (user !== DASHBOARD_USER || pass !== DASHBOARD_PASSWORD) {
     res.set("WWW-Authenticate", 'Basic realm="Rios Dashboard"');
     return res.status(401).send("Usuário ou senha inválidos");
@@ -47,54 +43,42 @@ function dashboardAuth(req, res, next) {
   next();
 }
 
-async function api(path, options = {}) {
+async function queueApi(path, options = {}) {
   const res = await fetch(QUEUE_API_URL + path, {
     ...options,
-    headers: {
-      "content-type": "application/json",
-      "x-worker-token": WORKER_TOKEN,
-      ...(options.headers || {})
-    }
+    headers: { "content-type": "application/json", "x-worker-token": WORKER_TOKEN, ...(options.headers || {}) }
   });
-  if (!res.ok) throw new Error(`Queue API ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new Error("Queue API " + res.status + ": " + await res.text());
   return res.json();
 }
 
 async function adminApi(path, options = {}) {
   const res = await fetch(ADMIN_API_URL + path, {
     ...options,
-    headers: {
-      "content-type": "application/json",
-      "x-admin-token": ADMIN_TOKEN,
-      ...(options.headers || {})
-    }
+    headers: { "content-type": "application/json", "x-admin-token": ADMIN_TOKEN, ...(options.headers || {}) }
   });
-  if (!res.ok) throw new Error(`Admin API ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new Error("Admin API " + res.status + ": " + await res.text());
   return res.json();
 }
 
 async function reportState(extra = {}) {
   try {
-    await api("/state", {
-      method: "POST",
-      body: JSON.stringify({ status: waStatus, phone: waPhone, ...extra })
-    });
-  } catch (err) {
-    console.error("Falha ao atualizar estado:", err.message);
+    await queueApi("/state", { method: "POST", body: JSON.stringify({ status: waStatus, phone: waPhone, ...extra }) });
+  } catch (e) {
+    console.error("Falha ao atualizar estado:", e.message);
   }
 }
 
 async function connectWhatsApp() {
   clearTimeout(reconnectTimer);
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  const { version } = await fetchLatestBaileysVersion();
-
+  const authState = await useMultiFileAuthState(AUTH_DIR);
+  const versionInfo = await fetchLatestBaileysVersion();
   waStatus = "connecting";
   await reportState();
 
   socket = makeWASocket({
-    version,
-    auth: state,
+    version: versionInfo.version,
+    auth: authState.state,
     logger: pino({ level: "silent" }),
     printQRInTerminal: false,
     browser: ["Kirvano Automation", "Chrome", "1.0.0"],
@@ -102,10 +86,11 @@ async function connectWhatsApp() {
     markOnlineOnConnect: false
   });
 
-  socket.ev.on("creds.update", saveCreds);
-
+  socket.ev.on("creds.update", authState.saveCreds);
   socket.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+    const connection = update.connection;
+    const lastDisconnect = update.lastDisconnect;
+    const qr = update.qr;
 
     if (qr) {
       qrDataUrl = await QRCode.toDataURL(qr, { width: 360, margin: 2 });
@@ -126,9 +111,7 @@ async function connectWhatsApp() {
       const code = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = code === DisconnectReason.loggedOut;
       waStatus = loggedOut ? "disconnected" : "connecting";
-      await reportState({
-        last_error: loggedOut ? "Sessão desconectada. Escaneie um novo QR." : "Conexão caiu; reconectando."
-      });
+      await reportState({ last_error: loggedOut ? "Sessão desconectada. Escaneie um novo QR." : "Conexão caiu; reconectando." });
       if (!loggedOut) reconnectTimer = setTimeout(connectWhatsApp, 3000);
       else qrDataUrl = null;
     }
@@ -140,31 +123,22 @@ async function processQueue() {
   processing = true;
   let item = null;
   try {
-    const result = await api("/next");
+    const result = await queueApi("/next");
     item = result.message || null;
     if (!item) return;
-
     const phone = String(item.phone || "").replace(/\D/g, "");
     if (!phone) throw new Error("Telefone inválido");
-
     const jid = phone + "@s.whatsapp.net";
     const exists = await socket.onWhatsApp(jid);
     if (!exists?.[0]?.exists) throw new Error("Número não encontrado no WhatsApp");
-
     await socket.sendMessage(jid, { text: item.message });
-    await api("/ack", {
-      method: "POST",
-      body: JSON.stringify({ id: item.id, status: "sent" })
-    });
+    await queueApi("/ack", { method: "POST", body: JSON.stringify({ id: item.id, status: "sent" }) });
     console.log("Mensagem enviada:", item.id, phone);
-  } catch (err) {
-    console.error("Erro no processamento:", err.message);
+  } catch (e) {
+    console.error("Erro no processamento:", e.message);
     if (item?.id) {
       try {
-        await api("/ack", {
-          method: "POST",
-          body: JSON.stringify({ id: item.id, status: "failed", error: String(err.message || err) })
-        });
+        await queueApi("/ack", { method: "POST", body: JSON.stringify({ id: item.id, status: "failed", error: String(e.message || e) }) });
       } catch {}
     }
   } finally {
@@ -172,93 +146,61 @@ async function processQueue() {
   }
 }
 
-app.get("/", (_req, res) => {
-  res.type("html").send(`<!doctype html>
-<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WhatsApp Kirvano</title>
-<style>body{font-family:Arial,sans-serif;background:#0b0b0b;color:#fff;display:grid;place-items:center;min-height:100vh;margin:0}.card{background:#171717;padding:28px;border-radius:18px;max-width:460px;width:calc(100% - 40px);text-align:center}img{max-width:100%;border-radius:12px;background:#fff}.ok{color:#22c55e}.warn{color:#f59e0b}a{color:#fff}small{color:#aaa}</style></head>
-<body><div class="card"><h1>WhatsApp Kirvano</h1><p>Status: <strong class="${waStatus === "connected" ? "ok" : "warn"}">${waStatus}</strong></p>
-${waPhone ? `<p>Número: ${waPhone}</p>` : ""}
-${qrDataUrl ? `<img src="${qrDataUrl}" alt="QR Code"><p>WhatsApp → Aparelhos conectados → Conectar aparelho</p>` : waStatus === "connected" ? "<p>Conectado e pronto para enviar.</p>" : "<p>Aguardando QR Code...</p>"}
-<p><a href="/dashboard">Abrir dashboard</a></p><small>A página atualiza a cada 8 segundos.</small></div><script>setTimeout(()=>location.reload(),8000)</script></body></html>`);
-});
+function qrPage() {
+  var body = '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WhatsApp Kirvano</title>';
+  body += '<style>body{font-family:Arial,sans-serif;background:#0b0b0b;color:#fff;display:grid;place-items:center;min-height:100vh;margin:0}.card{background:#171717;padding:28px;border-radius:18px;max-width:460px;width:calc(100% - 40px);text-align:center}img{max-width:100%;border-radius:12px;background:#fff}.ok{color:#22c55e}.warn{color:#f59e0b}a{color:#fff}small{color:#aaa}</style></head><body><div class="card">';
+  body += '<h1>WhatsApp Kirvano</h1><p>Status: <strong class="' + (waStatus === "connected" ? "ok" : "warn") + '">' + waStatus + '</strong></p>';
+  if (waPhone) body += '<p>Número: ' + waPhone + '</p>';
+  if (qrDataUrl) body += '<img src="' + qrDataUrl + '" alt="QR Code"><p>WhatsApp → Aparelhos conectados → Conectar aparelho</p>';
+  else if (waStatus === "connected") body += '<p>Conectado e pronto para enviar.</p>';
+  else body += '<p>Aguardando QR Code...</p>';
+  body += '<p><a href="/dashboard">Abrir dashboard</a></p><small>A página atualiza a cada 8 segundos.</small></div><script>setTimeout(function(){location.reload()},8000)</script></body></html>';
+  return body;
+}
 
-app.get("/health", (_req, res) => res.json({ ok: true, whatsapp: waStatus, phone: waPhone }));
+const dashboardHtml = '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Rios Dashboard</title>' +
+'<style>*{box-sizing:border-box}body{margin:0;font-family:Arial,sans-serif;background:#0b0b0d;color:#f5f5f5}.wrap{max-width:1280px;margin:auto;padding:28px}.top{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:22px}h1{font-size:25px;margin:0}.muted{color:#9ca3af}.status{padding:7px 10px;border-radius:999px;background:#162319;color:#86efac;font-size:13px}.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:20px}.card{background:#151518;border:1px solid #26262b;border-radius:16px;padding:18px}.num{font-size:28px;font-weight:700;margin-top:7px}.tabs{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0}.tab{border:1px solid #2c2c31;background:#17171a;color:#ddd;border-radius:10px;padding:10px 14px;cursor:pointer}.tab.active{background:#fff;color:#111}.panel{display:none}.panel.active{display:block}table{width:100%;border-collapse:collapse;background:#151518}th,td{text-align:left;padding:12px;border-bottom:1px solid #26262b;font-size:13px;vertical-align:top}th{color:#aaa}.badge{display:inline-block;padding:4px 8px;border-radius:999px;background:#232329}.sent{color:#86efac}.failed{color:#fca5a5}.queued{color:#fde68a}.template{background:#151518;border:1px solid #26262b;border-radius:16px;padding:18px;margin-bottom:12px}textarea{width:100%;min-height:150px;background:#0f0f11;color:#fff;border:1px solid #303038;border-radius:10px;padding:12px}.save{margin-top:10px;background:#22c55e;border:0;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer}.small{font-size:12px;color:#999}.scroll{overflow:auto}@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.wrap{padding:16px}}</style></head><body>' +
+'<div class="wrap"><div class="top"><div><h1>Automação WhatsApp</h1><div class="muted">Kirvano → Supabase → WhatsApp</div></div><div id="wa" class="status">carregando...</div></div>' +
+'<div class="cards"><div class="card"><div class="muted">Contatos salvos</div><div class="num" id="contacts">0</div></div><div class="card"><div class="muted">Mensagens enviadas</div><div class="num" id="sent">0</div></div><div class="card"><div class="muted">Na fila</div><div class="num" id="queued">0</div></div><div class="card"><div class="muted">Falhas</div><div class="num" id="failed">0</div></div><div class="card"><div class="muted">Eventos hoje</div><div class="num" id="eventsToday">0</div></div></div>' +
+'<div class="tabs"><button class="tab active" data-tab="contactsPanel">Contatos</button><button class="tab" data-tab="templatesPanel">Mensagens</button><button class="tab" data-tab="historyPanel">Histórico</button><button class="tab" data-tab="eventsPanel">Eventos</button></div>' +
+'<div id="contactsPanel" class="panel active"><div class="scroll"><table><thead><tr><th>Nome</th><th>Celular</th><th>Produto</th><th>Último evento</th><th>Último contato</th><th>Opt-in disparos</th></tr></thead><tbody id="contactsBody"></tbody></table></div></div>' +
+'<div id="templatesPanel" class="panel"><div id="templates"></div><div class="small">Variáveis: {{name}}, {{full_name}}, {{product}}, {{sale_id}}, {{total_price}}, {{pix_code}}, {{boleto_link}}</div></div>' +
+'<div id="historyPanel" class="panel"><div class="scroll"><table><thead><tr><th>Data</th><th>Nome</th><th>Celular</th><th>Status</th><th>Mensagem</th></tr></thead><tbody id="messagesBody"></tbody></table></div></div>' +
+'<div id="eventsPanel" class="panel"><div class="scroll"><table><thead><tr><th>Data</th><th>Evento</th><th>Status</th><th>Erro</th></tr></thead><tbody id="eventsBody"></tbody></table></div></div></div>' +
+'<script>' +
+'function esc(s){return String(s==null?"":s).replace(/[&<>"\\x27]/g,function(m){return {"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","\\x27":"&#039;"}[m]||m})}' +
+'function fmt(s){return s?new Date(s).toLocaleString("pt-BR"):"—"}' +
+'async function get(p){var r=await fetch("/admin-api"+p);if(!r.ok)throw new Error(await r.text());return r.json()}' +
+'async function post(p,b){var r=await fetch("/admin-api"+p,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(b)});if(!r.ok)throw new Error(await r.text());return r.json()}' +
+'async function load(){var all=await Promise.all([get("/stats"),get("/contacts"),get("/messages"),get("/events"),get("/templates")]);var s=all[0],c=all[1],m=all[2],e=all[3],t=all[4];' +
+'document.getElementById("contacts").textContent=s.contacts;document.getElementById("sent").textContent=s.sent;document.getElementById("queued").textContent=s.queued;document.getElementById("failed").textContent=s.failed;document.getElementById("eventsToday").textContent=s.events_today;document.getElementById("wa").textContent="WhatsApp: "+((s.whatsapp&&s.whatsapp.status)||"desconhecido");' +
+'document.getElementById("contactsBody").innerHTML=c.contacts.map(function(x){return "<tr><td>"+esc(x.name||"—")+"</td><td>"+esc(x.phone)+"</td><td>"+esc(x.product_name||x.product_id||"—")+"</td><td>"+esc(x.last_event_type||"—")+"</td><td>"+fmt(x.last_seen_at)+"</td><td>"+(x.broadcast_opt_in?"sim":"não")+"</td></tr>"}).join("");' +
+'document.getElementById("messagesBody").innerHTML=m.messages.map(function(x){return "<tr><td>"+fmt(x.queued_at)+"</td><td>"+esc(x.customer_name||"—")+"</td><td>"+esc(x.phone)+"</td><td><span class=\\"badge "+esc(x.status)+"\\">"+esc(x.status)+"</span></td><td style=\\"max-width:420px;white-space:pre-wrap\\">"+esc(x.message)+"</td></tr>"}).join("");' +
+'document.getElementById("eventsBody").innerHTML=e.events.map(function(x){return "<tr><td>"+fmt(x.received_at)+"</td><td>"+esc(x.event_type)+"</td><td>"+esc(x.status)+"</td><td>"+esc(x.error_message||"—")+"</td></tr>"}).join("");' +
+'document.getElementById("templates").innerHTML=t.templates.map(function(x){return "<div class=\\"template\\"><b>"+esc(x.name)+"</b><div class=\\"small\\">"+esc(x.event_type)+(x.product_id?" • Produto "+esc(x.product_id):" • Todos os produtos")+"</div><textarea id=\\"tpl-"+x.id+"\\">"+esc(x.body)+"</textarea><button class=\\"save\\" onclick=\\"saveTemplate(\\x27"+x.id+"\\x27)\\">Salvar mensagem</button></div>"}).join("")}' +
+'async function saveTemplate(id){var el=document.getElementById("tpl-"+id);await post("/templates",{id:id,body:el.value,active:true});alert("Mensagem salva.")}' +
+'document.querySelectorAll(".tab").forEach(function(b){b.onclick=function(){document.querySelectorAll(".tab,.panel").forEach(function(x){x.classList.remove("active")});b.classList.add("active");document.getElementById(b.dataset.tab).classList.add("active")}});load().catch(function(e){alert("Erro ao carregar dashboard: "+e.message)});' +
+'</script></body></html>';
 
-app.all("/admin-api/*path", dashboardAuth, async (req, res) => {
+app.get("/", function(req, res) { res.type("html").send(qrPage()); });
+app.get("/health", function(req, res) { res.json({ ok: true, whatsapp: waStatus, phone: waPhone }); });
+
+app.all("/admin-api/*path", auth, async function(req, res) {
   try {
-    const suffix = "/" + (req.params.path || []).join("/");
-    const data = await adminApi(suffix, {
+    var p = req.params.path;
+    var suffix = "/" + (Array.isArray(p) ? p.join("/") : String(p || ""));
+    var data = await adminApi(suffix, {
       method: req.method,
-      body: ["GET", "HEAD"].includes(req.method) ? undefined : JSON.stringify(req.body || {})
+      body: (req.method === "GET" || req.method === "HEAD") ? undefined : JSON.stringify(req.body || {})
     });
     res.json(data);
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-app.get("/dashboard", dashboardAuth, (_req, res) => {
-  res.type("html").send(`<!doctype html>
-<html lang="pt-BR">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Rios • WhatsApp Dashboard</title>
-<style>
-*{box-sizing:border-box}body{margin:0;font-family:Inter,Arial,sans-serif;background:#0b0b0d;color:#f5f5f5}
-.wrap{max-width:1280px;margin:auto;padding:28px}.top{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:22px}
-h1{font-size:25px;margin:0}.muted{color:#9ca3af}.status{padding:7px 10px;border-radius:999px;background:#162319;color:#86efac;font-size:13px}
-.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:20px}.card{background:#151518;border:1px solid #26262b;border-radius:16px;padding:18px}.num{font-size:28px;font-weight:700;margin-top:7px}
-.tabs{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0}.tab{border:1px solid #2c2c31;background:#17171a;color:#ddd;border-radius:10px;padding:10px 14px;cursor:pointer}.tab.active{background:#fff;color:#111}
-.panel{display:none}.panel.active{display:block}table{width:100%;border-collapse:collapse;background:#151518;border-radius:14px;overflow:hidden}th,td{text-align:left;padding:12px;border-bottom:1px solid #26262b;font-size:13px;vertical-align:top}th{color:#aaa}
-.badge{display:inline-block;padding:4px 8px;border-radius:999px;background:#232329}.sent{color:#86efac}.failed{color:#fca5a5}.queued{color:#fde68a}
-.template{background:#151518;border:1px solid #26262b;border-radius:16px;padding:18px;margin-bottom:12px}textarea{width:100%;min-height:150px;background:#0f0f11;color:#fff;border:1px solid #303038;border-radius:10px;padding:12px;resize:vertical}button.save{margin-top:10px;background:#22c55e;border:0;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer}
-.small{font-size:12px;color:#999}.scroll{overflow:auto}.empty{padding:28px;text-align:center;color:#888}
-@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.wrap{padding:16px}.top{align-items:flex-start;flex-direction:column}}
-</style>
-</head>
-<body><div class="wrap">
-<div class="top"><div><h1>Automação WhatsApp</h1><div class="muted">Kirvano → Supabase → WhatsApp</div></div><div id="wa" class="status">carregando...</div></div>
-<div class="cards">
-<div class="card"><div class="muted">Contatos salvos</div><div class="num" id="contacts">0</div></div>
-<div class="card"><div class="muted">Mensagens enviadas</div><div class="num" id="sent">0</div></div>
-<div class="card"><div class="muted">Na fila</div><div class="num" id="queued">0</div></div>
-<div class="card"><div class="muted">Falhas</div><div class="num" id="failed">0</div></div>
-<div class="card"><div class="muted">Eventos hoje</div><div class="num" id="eventsToday">0</div></div>
-</div>
-<div class="tabs">
-<button class="tab active" data-tab="contactsPanel">Contatos</button>
-<button class="tab" data-tab="templatesPanel">Mensagens</button>
-<button class="tab" data-tab="historyPanel">Histórico</button>
-<button class="tab" data-tab="eventsPanel">Eventos</button>
-</div>
-<div id="contactsPanel" class="panel active"><div class="scroll"><table><thead><tr><th>Nome</th><th>Celular</th><th>Produto</th><th>Último evento</th><th>Último contato</th><th>Opt-in disparos</th></tr></thead><tbody id="contactsBody"></tbody></table></div></div>
-<div id="templatesPanel" class="panel"><div id="templates"></div><div class="small">Variáveis disponíveis: {{name}}, {{full_name}}, {{product}}, {{sale_id}}, {{total_price}}, {{pix_code}}, {{boleto_link}}</div></div>
-<div id="historyPanel" class="panel"><div class="scroll"><table><thead><tr><th>Data</th><th>Nome</th><th>Celular</th><th>Status</th><th>Mensagem</th></tr></thead><tbody id="messagesBody"></tbody></table></div></div>
-<div id="eventsPanel" class="panel"><div class="scroll"><table><thead><tr><th>Data</th><th>Evento</th><th>Status</th><th>Erro</th></tr></thead><tbody id="eventsBody"></tbody></table></div></div>
-</div>
-<script>
-const esc=s=>String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#039;"}[m]||m));
-const fmt=s=>s?new Date(s).toLocaleString("pt-BR"):"—";
-async function get(path){const r=await fetch("/admin-api"+path);if(!r.ok)throw new Error(await r.text());return r.json()}
-async function post(path,body){const r=await fetch("/admin-api"+path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});if(!r.ok)throw new Error(await r.text());return r.json()}
-async function load(){
- const [stats,contacts,messages,events,templates]=await Promise.all([get("/stats"),get("/contacts"),get("/messages"),get("/events"),get("/templates")]);
- document.getElementById("contacts").textContent=stats.contacts;document.getElementById("sent").textContent=stats.sent;document.getElementById("queued").textContent=stats.queued;document.getElementById("failed").textContent=stats.failed;document.getElementById("eventsToday").textContent=stats.events_today;
- document.getElementById("wa").textContent="WhatsApp: "+(stats.whatsapp?.status||"desconhecido");
- document.getElementById("contactsBody").innerHTML=contacts.contacts.map(c=>`<tr><td>${esc(c.name||"—")}</td><td>${esc(c.phone)}</td><td>${esc(c.product_name||c.product_id||"—")}</td><td>${esc(c.last_event_type||"—")}</td><td>${fmt(c.last_seen_at)}</td><td><input type="checkbox" ${c.broadcast_opt_in?"checked":""} onchange="setOptIn('${esc(c.phone)}',this.checked)"></td></tr>`).join("")||'<tr><td colspan="6" class="empty">Nenhum contato salvo.</td></tr>';
- document.getElementById("messagesBody").innerHTML=messages.messages.map(m=>`<tr><td>${fmt(m.queued_at)}</td><td>${esc(m.customer_name||"—")}</td><td>${esc(m.phone)}</td><td><span class="badge ${esc(m.status)}">${esc(m.status)}</span></td><td style="max-width:420px;white-space:pre-wrap">${esc(m.message)}</td></tr>`).join("");
- document.getElementById("eventsBody").innerHTML=events.events.map(e=>`<tr><td>${fmt(e.received_at)}</td><td>${esc(e.event_type)}</td><td>${esc(e.status)}</td><td>${esc(e.error_message||"—")}</td></tr>`).join("");
- document.getElementById("templates").innerHTML=templates.templates.map(t=>`<div class="template"><b>${esc(t.name)}</b><div class="small">${esc(t.event_type)}${t.product_id?" • Produto "+esc(t.product_id):" • Todos os produtos"}</div><textarea id="tpl-${t.id}">${esc(t.body)}</textarea><button class="save" onclick="saveTemplate('${t.id}')">Salvar mensagem</button></div>`).join("");
-}
-async function saveTemplate(id){const el=document.getElementById("tpl-"+id);await post("/templates",{id,body:el.value,active:true});alert("Mensagem salva.");}
-async function setOptIn(phone,val){await post("/contacts/opt-in",{phone,broadcast_opt_in:val});}
-document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>{document.querySelectorAll(".tab,.panel").forEach(x=>x.classList.remove("active"));b.classList.add("active");document.getElementById(b.dataset.tab).classList.add("active")});
-load().catch(e=>alert("Erro ao carregar dashboard: "+e.message));
-setInterval(()=>get("/stats").then(s=>document.getElementById("wa").textContent="WhatsApp: "+(s.whatsapp?.status||"desconhecido")).catch(()=>{}),15000);
-</script></body></html>`);
-});
+app.get("/dashboard", auth, function(req, res) { res.type("html").send(dashboardHtml); });
 
-app.listen(PORT, "0.0.0.0", () => console.log("Servidor iniciado na porta", PORT));
-
+app.listen(PORT, "0.0.0.0", function() { console.log("Servidor iniciado na porta", PORT); });
 await connectWhatsApp();
 setInterval(processQueue, POLL_MS);
