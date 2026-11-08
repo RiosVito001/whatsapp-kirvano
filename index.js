@@ -4,7 +4,7 @@ import pino from "pino";
 import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } from "@whiskeysockets/baileys";
 
 const PORT = Number(process.env.PORT || 3000);
-const AUTH_DIR = process.env.AUTH_DIR || "/data/auth";
+const AUTH_DIR = `${process.env.AUTH_DIR || "/data/auth"}/reconnect-2026-11-08`;
 const QUEUE_API_URL = process.env.QUEUE_API_URL;
 const WORKER_TOKEN = process.env.WORKER_TOKEN;
 const ADMIN_API_URL = process.env.ADMIN_API_URL;
@@ -225,7 +225,10 @@ const dashboardHtml = '<!doctype html><html lang="pt-BR"><head><meta charset="ut
 'document.querySelectorAll(".tab").forEach(function(b){b.onclick=function(){document.querySelectorAll(".tab,.panel").forEach(function(x){x.classList.remove("active")});b.classList.add("active");document.getElementById(b.dataset.tab).classList.add("active")}});load().catch(function(e){alert("Erro ao carregar dashboard: "+e.message)});' +
 '</script></body></html>';
 
-app.get("/", function(req, res) { res.type("html").send(qrPage()); });
+app.get("/", auth, function(req, res) {
+  res.set("Cache-Control", "no-store");
+  res.type("html").send(qrPage());
+});
 app.get("/health", function(req, res) { res.json({ ok: true, whatsapp: waStatus, phone: waPhone }); });
 
 app.all("/admin-api/*path", auth, async function(req, res) {
